@@ -14,7 +14,8 @@ defmodule Redix.Stream.Consumer do
           consumer_name: consumer_name(),
           handler: function() | Redix.Stream.handler(),
           process_pending: boolean(),
-          raise_errors: boolean()
+          raise_errors: boolean(),
+          batch_size: non_neg_integer()
         }
 
   @default_timeout 2_000
@@ -67,6 +68,7 @@ defmodule Redix.Stream.Consumer do
     create_not_exists = Keyword.get(opts, :create_not_exists, true)
     process_pending = Keyword.get(opts, :process_pending, true)
     raise_errors = Keyword.get(opts, :raise_errors, true)
+    batch_size = Keyword.get(opts, :batch_size, 1000)
 
     default_start_pos =
       case group_name do
@@ -103,7 +105,8 @@ defmodule Redix.Stream.Consumer do
        consumer_name: consumer_name,
        handler: handler,
        process_pending: process_pending,
-       raise_errors: raise_errors
+       raise_errors: raise_errors,
+       batch_size: batch_size
      }}
   end
 
@@ -111,16 +114,12 @@ defmodule Redix.Stream.Consumer do
     :ok
   end
 
-  def ack(consumer, id), do: GenServer.call(consumer, {:ack, id}, :infinity)
+  def ack(redix, {stream, group_name, id}) when is_binary(id) do
+    ack(redix, {stream, group_name, [id]})
+  end
 
-  def handle_call({:ack, id}, _from,
-    state = %{
-      redix: redix,
-      stream: stream,
-      group_name: group_name
-    }) do
-    {:ok, num} = Redix.command(redix, ["XACK", stream, group_name, id])
-    {:reply, num, state}
+  def ack(redix, {stream, group_name, [_|_] = ids}) do
+    Redix.command(redix, ["XACK", stream, group_name | ids])
   end
 
   @doc """
@@ -188,25 +187,31 @@ defmodule Redix.Stream.Consumer do
 
   # With a consumer group
   def handle_info(
-        {:process_data, stream, [{id, values} | rest_stream_items], timeout, next_pos},
+        {:process_data, stream, [_|_] = stream_items, timeout, next_pos},
         state = %{
           handler: handler,
           redix: redix,
           group_name: group_name,
-          raise_errors: raise_errors
+          raise_errors: raise_errors,
+          batch_size: batch_size
         }
       ) when not is_nil(group_name) do
-    case call_handler(handler, stream, group_name, id, values) do
-      :ok ->
-        {:ok, _} = Redix.command(redix, ["XACK", stream, group_name, id])
 
-      :defer ->
-        :ok
+    # Peel off a batch
+    {batch, rest_stream_items} = Enum.split(stream_items, batch_size)
+    for {id, values} <- batch do
+      case call_handler(handler, stream, group_name, id, values) do
+        :ok ->
+          {:ok, _} = Redix.command(redix, ["XACK", stream, group_name, id])
 
-      {:error, error} ->
-        if raise_errors do
-          raise "#{__MODULE__} Error processing #{id}: #{inspect(error)}\n\nvalues:\n#{inspect(values)}"
-        end
+        :defer ->
+          :ok
+
+        {:error, error} ->
+          if raise_errors do
+            raise "#{__MODULE__} Error processing #{id}: #{inspect(error)}\n\nvalues:\n#{inspect(values)}"
+          end
+      end
     end
 
     # And stream more data...
@@ -314,7 +319,7 @@ defmodule Redix.Stream.Consumer do
 
   @spec stream_more_data(integer(), String.t()) :: :ok
   defp stream_more_data(timeout, next_pos) do
-    Process.send_after(self(), {:stream_more_data, timeout, next_pos}, 0)
+    send(self(), {:stream_more_data, timeout, next_pos})
 
     :ok
   end
@@ -326,7 +331,7 @@ defmodule Redix.Stream.Consumer do
           String.t()
         ) :: :ok
   defp process_data(stream, values, timeout, next_pos) do
-    Process.send_after(self(), {:process_data, stream, values, timeout, next_pos}, 0)
+    send(self(), {:process_data, stream, values, timeout, next_pos})
   end
 
   @spec ensure_stream_and_group(pid(), String.t(), String.t(), String.t(), boolean()) :: :ok
