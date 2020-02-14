@@ -111,7 +111,7 @@ defmodule Redix.Stream.Consumer do
     :ok
   end
 
-  def ack(consumer, id), do: GenServer.call(consumer, {:ack, id})
+  def ack(consumer, id), do: GenServer.call(consumer, {:ack, id}, :infinity)
 
   def handle_call({:ack, id}, _from,
     state = %{
